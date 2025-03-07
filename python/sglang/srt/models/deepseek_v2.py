@@ -70,6 +70,25 @@ is_hip_ = is_hip()
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
+try:  # 🔍
+    import os
+    import analysis_utils
+    from analysis_utils import (
+        PID,
+        ANALYSIS_ENABLED,
+        ANALYSIS_TYPE,
+        ANALYSIS_CACHE_DYNAMIC,
+        ANALYSIS_CACHE_STATIC,
+        ANALYSIS_CACHE_BATCH_ID,
+        ANALYSIS_TOKEN_NUM,
+        MAX_TOKENS_FOR_ANALYSIS,
+        save_analysis_cache_single_batch
+    )
+    ANALYSIS_MODULE_LOADED = True
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
+print(f"[{os.getpid()}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -1034,6 +1053,10 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
+        #     print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
+
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
@@ -1084,6 +1107,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+            global ANALYSIS_TOKEN_NUM
+            if not torch.any(input_ids):
+                ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
+            else:
+                if ANALYSIS_TOKEN_NUM <= MAX_TOKENS_FOR_ANALYSIS:
+                    ANALYSIS_CACHE_DYNAMIC.append({})
+                else:
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
+                ANALYSIS_TOKEN_NUM += input_ids.numel()
+
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -1233,6 +1267,20 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if is_hip_:
                         self_attn.w_scale *= 2.0
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:  # 🔍
+            if "router_weights" not in ANALYSIS_CACHE_STATIC:
+                ANALYSIS_CACHE_STATIC["router_weights"] = {}
+            for layer_idx, decoder in enumerate(self.model.layers):
+                if isinstance(decoder.mlp, DeepseekV2MoE):
+                    ANALYSIS_CACHE_STATIC["router_weights"][layer_idx] = decoder.mlp.gate.weight.data.clone().cpu()
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
+            if "router_bias" not in ANALYSIS_CACHE_STATIC:
+                ANALYSIS_CACHE_STATIC["router_bias"] = {}
+            for layer_idx, decoder in enumerate(self.model.layers):
+                if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                    ANALYSIS_CACHE_STATIC["router_bias"][layer_idx] = decoder.mlp.gate.e_score_correction_bias.data.clone().cpu()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
