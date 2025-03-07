@@ -140,6 +140,7 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_idx: Optional[int] = None,  # 🔍
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -173,6 +174,7 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
+            layer_idx=layer_idx,  # 🔍
         )
 
         if config.n_shared_experts is not None:
@@ -942,6 +944,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_idx=layer_id,  # 🔍
             )
         else:
             self.mlp = DeepseekV2MLP(

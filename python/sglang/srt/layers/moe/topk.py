@@ -19,12 +19,20 @@ import torch.nn.functional as F
 
 from sglang.srt.utils import get_compiler_backend
 
+try:  # 🔍
+    import analysis_utils
+    from analysis_utils import ANALYSIS_ENABLED, ANALYSIS_TYPE, ANALYSIS_CACHE_DYNAMIC, PID
+    ANALYSIS_MODULE_LOADED = True
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
+
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     assert (
         hidden_states.shape[0] == gating_output.shape[0]
@@ -38,6 +46,18 @@ def fused_topk_native(
     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": scores.clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
+
     return topk_weights, topk_ids
 
 
@@ -46,6 +66,7 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     from vllm import _custom_ops as ops
 
@@ -72,6 +93,17 @@ def fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": scores.clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
+
     return topk_weights, topk_ids
 
 
@@ -84,6 +116,7 @@ def grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -114,6 +147,16 @@ def grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": scores.clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
+
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
@@ -127,6 +170,7 @@ def biased_grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -157,6 +201,16 @@ def biased_grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": scores.clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
+
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
@@ -171,6 +225,7 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     # DeepSeek V2/V3/R1 uses biased_grouped_top
     if use_grouped_topk:
@@ -184,6 +239,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                layer_idx=layer_idx,  # 🔍
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -194,6 +250,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                layer_idx=layer_idx,  # 🔍
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(
@@ -201,6 +258,7 @@ def select_experts(
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            layer_idx=layer_idx,  # 🔍
         )
     elif custom_routing_function is None:
         topk_weights, topk_ids = fused_topk(
@@ -208,8 +266,12 @@ def select_experts(
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            layer_idx=layer_idx,  # 🔍
         )
     else:
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+            import warnings
+            warnings.warn(f"[{PID}] Using custom routing function which may be incompatible with `analysis_utils`. Some metrics are not available unless the custom function is manually adapted.")
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,

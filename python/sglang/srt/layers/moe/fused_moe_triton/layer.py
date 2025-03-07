@@ -130,6 +130,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         activation: str = "silu",
         inplace: bool = True,
         no_combine: bool = False,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -145,6 +146,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             activation=activation,
             inplace=inplace,
             no_combine=no_combine,
+            layer_idx=layer_idx,  # 🔍
         )
 
     def forward_cuda(
@@ -162,6 +164,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         activation: str = "silu",
         inplace: bool = True,
         no_combine: bool = False,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -173,6 +176,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            layer_idx=layer_idx,  # 🔍
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
@@ -201,6 +205,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 inplace=inplace and not no_combine,
                 activation=activation,
                 no_combine=no_combine,
+                layer_idx=layer_idx,  # 🔍
             )
 
     def forward_cpu(
@@ -216,6 +221,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -228,6 +234,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group,
             custom_routing_function,
             correction_bias,
+            layer_idx=layer_idx,  # 🔍
         )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
@@ -279,6 +286,7 @@ class FusedMoE(torch.nn.Module):
         use_presharded_weights: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        layer_idx: Optional[int] = None,  # 🔍
     ):
         super().__init__()
 
@@ -305,6 +313,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.layer_idx = layer_idx  # 🔍
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -631,6 +640,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             inplace=self.inplace,
             no_combine=self.no_combine,
+            layer_idx=self.layer_idx,  # 🔍
         )
 
         if self.reduce_results and self.tp_size > 1:

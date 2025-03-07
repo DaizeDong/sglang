@@ -232,6 +232,7 @@ class W8A8Int8MoEMethod:
         activation: str = "silu",
         inplace: bool = True,
         no_combine: bool = False,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -247,6 +248,7 @@ class W8A8Int8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            layer_idx=layer_idx,  # 🔍
         )
 
         return fused_experts(
