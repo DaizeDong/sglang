@@ -15,7 +15,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
-
+import re
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -208,20 +208,59 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_inputs" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if "router_inputs" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"] = {}
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"][self.layer_idx] = hidden_states.clone().cpu()
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
+
+            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+                if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+                if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                    for name, p in [
+                        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                        for string in ANALYSIS_TYPE
+                        if re.search(r"magnitude_l(\d+)", string)
+                    ]:
+                        if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                            ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                        if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                            ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["shared_experts_outputs"] = torch.norm(shared_output, p=p, dim=-1, dtype=torch.float32).cpu()
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
         )
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+            if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                for name, p in [
+                    (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                    for string in ANALYSIS_TYPE
+                    if re.search(r"magnitude_l(\d+)", string)
+                ]:
+                    if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                    if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["routed_experts_outputs"] = torch.norm(final_hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if not (ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED):
+            if self.tp_size > 1:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -907,6 +946,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.layer_idx = layer_id  # 🔍
         self.enable_dp_attention = (
             not global_server_args_dict["disable_mla"]
             and global_server_args_dict["enable_dp_attention"]
@@ -993,16 +1033,65 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                for name, p in [
+                    (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                    for string in ANALYSIS_TYPE
+                    if re.search(r"magnitude_l(\d+)", string)
+                ]:
+                    if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                    if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_residual"] = torch.norm(residual, p=p, dim=-1, dtype=torch.float32).cpu()
+
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                for name, p in [
+                    (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                    for string in ANALYSIS_TYPE
+                    if re.search(r"magnitude_l(\d+)", string)
+                ]:
+                    if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                    if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
+
+            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                for name, p in [
+                    (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                    for string in ANALYSIS_TYPE
+                    if re.search(r"magnitude_l(\d+)", string)
+                ]:
+                    if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                    if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_residual_outputs"] = torch.norm(hidden_states + residual.to(torch.float32), p=p, dim=-1, dtype=torch.float32).cpu()
+
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
 
         # Fully Connected
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            for name, p in [
+                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                for string in ANALYSIS_TYPE
+                if re.search(r"magnitude_l(\d+)", string)
+            ]:
+                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_residual"] = torch.norm(residual, p=p, dim=-1, dtype=torch.float32).cpu()
+
         if self.enable_dp_attention:
             hidden_states, start_idx, end_idx = all_gather(
                 hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
@@ -1011,6 +1100,30 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = hidden_states[start_idx:end_idx]
         else:
             hidden_states = self.mlp(hidden_states)
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            for name, p in [
+                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                for string in ANALYSIS_TYPE
+                if re.search(r"magnitude_l(\d+)", string)
+            ]:
+                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            for name, p in [
+                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                for string in ANALYSIS_TYPE
+                if re.search(r"magnitude_l(\d+)", string)
+            ]:
+                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_residual_outputs"] = torch.norm(hidden_states + residual.to(torch.float32), p=p, dim=-1, dtype=torch.float32).cpu()
 
         return hidden_states, residual
 
