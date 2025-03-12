@@ -205,7 +205,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 inplace=inplace and not no_combine,
                 activation=activation,
                 no_combine=no_combine,
-                layer_idx=layer_idx,  # 🔍
             )
 
     def forward_cpu(
