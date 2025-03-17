@@ -15,6 +15,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
+import math
 import re
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -79,15 +80,12 @@ try:  # 🔍
         ANALYSIS_TYPE,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
-        ANALYSIS_CACHE_BATCH_ID,
-        ANALYSIS_TOKEN_NUM,
-        MAX_TOKENS_FOR_ANALYSIS,
+        ANALYSIS_ARGS,
         save_analysis_cache_single_batch
     )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
-print(f"[{os.getpid()}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1224,15 +1222,16 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
-            global ANALYSIS_TOKEN_NUM
             if not torch.any(input_ids):
                 ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
             else:
-                if ANALYSIS_TOKEN_NUM <= MAX_TOKENS_FOR_ANALYSIS:
+                if "recorded_tokens" not in ANALYSIS_ARGS:
+                    ANALYSIS_ARGS["recorded_tokens"] = 0
+                ANALYSIS_ARGS["recorded_tokens"] += input_ids.numel()
+                if ANALYSIS_ARGS["recorded_tokens"] <= ANALYSIS_ARGS.get("max_tokens", math.inf):
                     ANALYSIS_CACHE_DYNAMIC.append({})
                 else:
                     ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
-                ANALYSIS_TOKEN_NUM += input_ids.numel()
 
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
