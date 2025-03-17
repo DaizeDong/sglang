@@ -110,6 +110,23 @@ from sglang.srt.utils import (
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+try:  # 🔍
+    import os
+    import analysis_utils
+    from analysis_utils import (
+        PID,
+        ANALYSIS_ENABLED,
+        ANALYSIS_TYPE,
+        ANALYSIS_CACHE_DYNAMIC,
+        ANALYSIS_CACHE_STATIC,
+        ANALYSIS_ARGS,
+        save_analysis_cache_single_batch
+    )
+    ANALYSIS_MODULE_LOADED = True
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
+print(f"[{os.getpid()}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -1233,6 +1250,14 @@ class Scheduler:
             ret = EmbeddingBatchResult(
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
+
+        # batch-wise saving
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and self.tp_rank == 0:  # 🔍
+            if "batch_id" not in ANALYSIS_ARGS:
+                ANALYSIS_ARGS["batch_id"] = -1
+            ANALYSIS_ARGS["batch_id"] += 1
+            save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
+
         return ret
 
     def process_batch_result(

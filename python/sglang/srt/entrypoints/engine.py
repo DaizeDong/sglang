@@ -66,13 +66,6 @@ from sglang.srt.utils import (
 )
 from sglang.version import __version__
 
-try:  # 🔍
-    import analysis_utils
-    from analysis_utils import save_analysis_cache, PID
-    ANALYSIS_MODULE_LOADED = True
-except Exception as e:
-    ANALYSIS_MODULE_LOADED = False
-
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -173,13 +166,9 @@ class Engine:
                     except StopAsyncIteration:
                         break
 
-            if ANALYSIS_MODULE_LOADED:  # 🔍
-                save_analysis_cache()
             return generator_wrapper()
         else:
             ret = loop.run_until_complete(generator.__anext__())
-            if ANALYSIS_MODULE_LOADED:  # 🔍
-                save_analysis_cache()
             return ret
 
     async def async_generate(
