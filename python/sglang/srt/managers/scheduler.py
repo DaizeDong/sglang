@@ -1260,7 +1260,13 @@ class Scheduler:
                 if "batch_id" not in ANALYSIS_ARGS:
                     ANALYSIS_ARGS["batch_id"] = -1
                 ANALYSIS_ARGS["batch_id"] += 1
-                save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
+
+                if "save_interval_tokens" in ANALYSIS_ARGS: # save every `save_interval_tokens` tokens
+                    if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
+                        ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
+                        save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
+                else:
+                    save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
 
         return ret
 
