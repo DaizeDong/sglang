@@ -72,19 +72,18 @@ if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
 try:  # 🔍
-    import os
     import analysis_utils
     from analysis_utils import (
         PID,
-        ANALYSIS_ENABLED,
         ANALYSIS_TYPE,
+        ANALYSIS_ARGS,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
-        ANALYSIS_ARGS,
-        save_analysis_cache_single_batch
     )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
+    import os
+    PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 
 
@@ -207,7 +206,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_inputs" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_inputs" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             if "router_inputs" not in ANALYSIS_CACHE_DYNAMIC[-1]:
                 ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"] = {}
             ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"][self.layer_idx] = hidden_states.clone().cpu()
@@ -217,7 +216,7 @@ class DeepseekV2MoE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:
                 if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
                 if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
@@ -239,7 +238,7 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:
             if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
             if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
@@ -257,7 +256,7 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if not (ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED):
+        if not (ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED):
             if self.tp_size > 1:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -1034,7 +1033,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
                 for name, p in [
                     (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                     for string in ANALYSIS_TYPE
@@ -1052,7 +1051,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
                 for name, p in [
                     (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                     for string in ANALYSIS_TYPE
@@ -1064,7 +1063,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
                     ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
                 for name, p in [
                     (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                     for string in ANALYSIS_TYPE
@@ -1081,7 +1080,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             for name, p in [
                 (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                 for string in ANALYSIS_TYPE
@@ -1102,7 +1101,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             for name, p in [
                 (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                 for string in ANALYSIS_TYPE
@@ -1114,7 +1113,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
                 ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             for name, p in [
                 (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                 for string in ANALYSIS_TYPE
@@ -1167,7 +1166,7 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
         #     print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
 
@@ -1221,7 +1220,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
+            print(input_ids)
             if not torch.any(input_ids):
                 ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
             else:
@@ -1383,14 +1383,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if _is_hip:
                         self_attn.w_scale *= 2.0
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:  # 🔍
             if "router_weights" not in ANALYSIS_CACHE_STATIC:
                 ANALYSIS_CACHE_STATIC["router_weights"] = {}
             for layer_idx, decoder in enumerate(self.model.layers):
                 if isinstance(decoder.mlp, DeepseekV2MoE):
                     ANALYSIS_CACHE_STATIC["router_weights"][layer_idx] = decoder.mlp.gate.weight.data.clone().cpu()
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
             if "router_bias" not in ANALYSIS_CACHE_STATIC:
                 ANALYSIS_CACHE_STATIC["router_bias"] = {}
             for layer_idx, decoder in enumerate(self.model.layers):

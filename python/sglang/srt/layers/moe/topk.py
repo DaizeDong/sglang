@@ -21,9 +21,15 @@ from sglang.srt.utils import get_compiler_backend
 
 try:  # 🔍
     import analysis_utils
-    from analysis_utils import ANALYSIS_ENABLED, ANALYSIS_TYPE, ANALYSIS_CACHE_DYNAMIC, PID
+    from analysis_utils import (
+        PID,
+        ANALYSIS_TYPE,
+        ANALYSIS_CACHE_DYNAMIC,
+    )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
+    import os
+    PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 
 
@@ -47,7 +53,7 @@ def fused_topk_native(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
@@ -93,7 +99,7 @@ def fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
@@ -147,7 +153,7 @@ def grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
@@ -201,7 +207,7 @@ def biased_grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
@@ -269,7 +275,7 @@ def select_experts(
             layer_idx=layer_idx,  # 🔍
         )
     else:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
             import warnings
             warnings.warn(f"[{PID}] Using custom routing function which may be incompatible with `analysis_utils`. Some metrics are not available unless the custom function is manually adapted.")
         topk_weights, topk_ids = custom_routing_function(
