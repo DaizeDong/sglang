@@ -79,21 +79,35 @@ try:  # 🔍
         ANALYSIS_ARGS,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
+        save_analysis_cache_single_batch,
     )
+
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
-    import os
     PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 
 
 @torch._dynamo.disable
 def record_value(value_name, value):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
     ANALYSIS_CACHE_DYNAMIC[-1][value_name] = value.clone().cpu()
+    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
 
 
 @torch._dynamo.disable
 def record_layer_value(value_name, value, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
     if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
         ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
     ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = value.clone().cpu()
@@ -101,6 +115,10 @@ def record_layer_value(value_name, value, layer_idx):  # 🔍
 
 @torch._dynamo.disable
 def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
     for name, p in [
         (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
         for string in ANALYSIS_TYPE
@@ -239,7 +257,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_inputs" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_value("router_inputs", hidden_states, self.layer_idx)
 
         num_tokens, hidden_dim = hidden_states.shape
@@ -247,11 +265,10 @@ class DeepseekV2MoE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-            if ANALYSIS_MODULE_LOADED:
-                if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+            if ANALYSIS_MODULE_LOADED:  # 🔍
+                if self.tp_size > 1:  # reduce ahead for accurate recording
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                if analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-                    record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
+                record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -260,11 +277,10 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-        if ANALYSIS_MODULE_LOADED:
-            if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if self.tp_size > 1:  # reduce ahead for accurate recording
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            if analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-                record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
+            record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1046,7 +1062,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if ANALYSIS_MODULE_LOADED:  # 🔍
                 record_layer_magnitude("attn_residual", residual, self.layer_idx)
 
             hidden_states = self.self_attn(
@@ -1055,7 +1071,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+            if ANALYSIS_MODULE_LOADED:  # 🔍
                 record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
                 record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
 
@@ -1064,7 +1080,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_magnitude("mlp_residual", residual, self.layer_idx)
 
         if self.enable_dp_attention:
@@ -1076,7 +1092,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_magnitude("mlp_outputs", hidden_states, self.layer_idx)
             record_layer_magnitude("mlp_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
 
@@ -1121,9 +1137,8 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             record_value("input_ids", input_ids)
-            print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
 
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -1176,18 +1191,22 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
-            if not torch.any(input_ids):
-                ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
-            else:
-                if "recorded_tokens" not in ANALYSIS_ARGS:
-                    ANALYSIS_ARGS["recorded_tokens"] = 0
-                ANALYSIS_ARGS["recorded_tokens"] += input_ids.numel()
-                if ANALYSIS_ARGS["recorded_tokens"] <= ANALYSIS_ARGS.get("max_tokens", math.inf):
-                    ANALYSIS_CACHE_DYNAMIC.append({})
+            with analysis_utils.ANALYSIS_CACHE_LOCK:
+                if not torch.any(input_ids):
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
                 else:
-                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
+                    if "recorded_tokens" not in ANALYSIS_ARGS:
+                        ANALYSIS_ARGS["recorded_tokens"] = 0
+                    ANALYSIS_ARGS["recorded_tokens"] += input_ids.numel()
+                    if ANALYSIS_ARGS["recorded_tokens"] <= ANALYSIS_ARGS.get("max_tokens", math.inf):
+                        ANALYSIS_CACHE_DYNAMIC.append({})
+                    else:
+                        ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
+                hidden_states = self.model(input_ids, positions, forward_batch)
 
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        else:
+            hidden_states = self.model(input_ids, positions, forward_batch)
+
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

@@ -122,7 +122,6 @@ try:  # 🔍
     )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
-    import os
     PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 print(f"[{PID}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
@@ -1257,11 +1256,11 @@ class Scheduler:
 
         # batch-wise saving
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
-            if "batch_id" not in ANALYSIS_ARGS:
-                ANALYSIS_ARGS["batch_id"] = -1
-            ANALYSIS_ARGS["batch_id"] += 1
-            save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
-            # ANALYSIS_CACHE_DYNAMIC.append(None)
+            with analysis_utils.ANALYSIS_CACHE_LOCK:
+                if "batch_id" not in ANALYSIS_ARGS:
+                    ANALYSIS_ARGS["batch_id"] = -1
+                ANALYSIS_ARGS["batch_id"] += 1
+                save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
 
         return ret
 

@@ -35,6 +35,14 @@ except Exception as e:
 
 @torch._dynamo.disable
 def record_layer_router_scores(value_name, logits, scores, topk_scores, topk_ids, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
+    if layer_idx is None:
+        return
     if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
         ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
     ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = {
@@ -65,7 +73,7 @@ def fused_topk_native(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
@@ -104,7 +112,7 @@ def fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
@@ -151,7 +159,7 @@ def grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
@@ -198,7 +206,7 @@ def biased_grouped_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
