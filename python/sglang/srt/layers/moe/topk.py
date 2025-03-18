@@ -33,6 +33,18 @@ except Exception as e:
     ANALYSIS_MODULE_LOADED = False
 
 
+@torch._dynamo.disable
+def record_layer_router_scores(value_name, logits, scores, topk_scores, topk_ids, layer_idx):  # 🔍
+    if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+        ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
+    ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = {
+        "logits": logits.clone().cpu(),
+        "scores": scores.clone().cpu(),
+        "topk_scores": topk_scores.clone().cpu(),
+        "topk_ids": topk_ids.clone().cpu(),
+    }
+
+
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -55,14 +67,7 @@ def fused_topk_native(
 
     if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights, topk_ids
 
@@ -101,14 +106,7 @@ def fused_topk(
 
     if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights, topk_ids
 
@@ -154,14 +152,7 @@ def grouped_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -208,14 +199,7 @@ def biased_grouped_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
