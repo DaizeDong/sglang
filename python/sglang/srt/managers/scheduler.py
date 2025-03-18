@@ -1254,18 +1254,23 @@ class Scheduler:
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
 
-        # batch-wise saving
+        # 🔍 batch-level saving
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
-            with analysis_utils.ANALYSIS_CACHE_LOCK:
-                if "batch_id" not in ANALYSIS_ARGS:
-                    ANALYSIS_ARGS["batch_id"] = -1
-                ANALYSIS_ARGS["batch_id"] += 1
+            if "batch_id" not in ANALYSIS_ARGS:
+                ANALYSIS_ARGS["batch_id"] = -1
+            ANALYSIS_ARGS["batch_id"] += 1
 
-                if "save_interval_tokens" in ANALYSIS_ARGS: # save every `save_interval_tokens` tokens
-                    if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
-                        ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
+            if "save_interval_tokens" in ANALYSIS_ARGS:
+                # save every `save_interval_tokens` tokens
+                # note that the last batch of tokens will be dropped
+                if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
+                    with analysis_utils.ANALYSIS_CACHE_LOCK:
+                        # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
                         save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
-                else:
+                    ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
+            else:
+                with analysis_utils.ANALYSIS_CACHE_LOCK:
+                    # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
                     save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
 
         return ret

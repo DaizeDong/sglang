@@ -1192,6 +1192,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
             with analysis_utils.ANALYSIS_CACHE_LOCK:
+                # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
                 if not torch.any(input_ids):
                     ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
                 else:
