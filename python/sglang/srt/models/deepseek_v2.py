@@ -81,7 +81,6 @@ try:  # 🔍
         ANALYSIS_CACHE_STATIC,
         save_analysis_cache_single_batch,
     )
-
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
     PID = os.getpid()
@@ -285,7 +284,7 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if not ANALYSIS_MODULE_LOADED:
+        if not ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 

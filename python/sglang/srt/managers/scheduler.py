@@ -1266,12 +1266,12 @@ class Scheduler:
                 if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
                     with analysis_utils.ANALYSIS_CACHE_LOCK:
                         # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
-                        save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
+                        save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=("last_save_tokens" not in ANALYSIS_ARGS), save_info=True, compress=True)
                     ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
             else:
                 with analysis_utils.ANALYSIS_CACHE_LOCK:
                     # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
-                    save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0, save_info=ANALYSIS_ARGS["batch_id"] == 0, compress=True)
+                    save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=(ANALYSIS_ARGS["batch_id"] == 0), save_info=True, compress=True)
 
         return ret
 
