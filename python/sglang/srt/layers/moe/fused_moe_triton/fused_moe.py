@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
@@ -42,9 +41,12 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+else:
+    from vllm import _custom_ops as vllm_ops
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -455,44 +457,34 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if num_experts >= 224:
-        if enable_moe_align_block_size_triton:
-            moe_align_block_size_triton(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-            )
-        else:
-            token_cnts_buffer = torch.zeros(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
-            )
-
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                token_cnts_buffer,
-                cumsum_buffer,
-            )
-    else:
-        ops.moe_align_block_size(
+    if enable_moe_align_block_size_triton:
+        moe_align_block_size_triton(
             topk_ids,
             num_experts,
             block_size,
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
+        )
+    else:
+        token_cnts_buffer = torch.zeros(
+            (num_experts + 1) * num_experts,
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+        cumsum_buffer = torch.zeros(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            token_cnts_buffer,
+            cumsum_buffer,
         )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
@@ -527,7 +519,10 @@ def invoke_fused_moe_kernel(
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
-            A, A_scale = ops.scaled_fp8_quant(A, A_scale)
+            if _is_cuda:
+                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            else:
+                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
@@ -1060,7 +1055,9 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
+            intermediate_cache2 = intermediate_cache2[
+                : tokens_in_chunk * topk_ids.shape[1]
+            ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
@@ -1095,12 +1092,16 @@ def fused_experts_impl(
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                vllm_ops.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
         elif activation == "gelu":
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                vllm_ops.gelu_and_mul(
+                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
@@ -1132,7 +1133,7 @@ def fused_experts_impl(
         if no_combine:
             pass
         elif _is_hip:
-            ops.moe_sum(
+            vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
