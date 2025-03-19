@@ -1192,19 +1192,21 @@ class DeepseekV2ForCausalLM(nn.Module):
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
             with analysis_utils.ANALYSIS_CACHE_LOCK:
                 # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
-                if not torch.any(input_ids):
+                if torch.cuda.is_current_stream_capturing():
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # no analysis during the stream capturing (this will also prevent exception from the following `torch.any(input_ids)` check)
+                elif not torch.any(input_ids):
                     ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
                 else:
                     if "recorded_tokens" not in ANALYSIS_ARGS:
                         ANALYSIS_ARGS["recorded_tokens"] = 0
                     ANALYSIS_ARGS["recorded_tokens"] += input_ids.numel()
-                    if ANALYSIS_ARGS["recorded_tokens"] <= ANALYSIS_ARGS.get("max_tokens", math.inf):
-                        ANALYSIS_CACHE_DYNAMIC.append({})
-                    else:
+                    if ANALYSIS_ARGS["recorded_tokens"] > ANALYSIS_ARGS.get("max_tokens", math.inf):
                         ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
+                    else:
+                        ANALYSIS_CACHE_DYNAMIC.append({})
                 hidden_states = self.model(input_ids, positions, forward_batch)
 
-        else:
+        else:  # vanilla forward without analysis
             hidden_states = self.model(input_ids, positions, forward_batch)
 
         return self.logits_processor(
