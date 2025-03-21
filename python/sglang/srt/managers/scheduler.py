@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import math
 import faulthandler
 import logging
 import os
@@ -1283,18 +1284,21 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 ANALYSIS_ARGS["batch_id"] = -1
             ANALYSIS_ARGS["batch_id"] += 1
 
-            if "save_interval_tokens" in ANALYSIS_ARGS:
-                # save every `save_interval_tokens` tokens
-                # note that the last batch of tokens will be dropped
-                if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
+            if ANALYSIS_ARGS.get("recorded_tokens", 0) > ANALYSIS_ARGS.get("max_tokens", math.inf):  # exceeds the max token limit
+                pass
+            else:
+                if "save_interval_tokens" in ANALYSIS_ARGS:
+                    # save every `save_interval_tokens` tokens
+                    # note that the last batch of tokens will be dropped
+                    if ANALYSIS_ARGS.get("recorded_tokens", 0) - ANALYSIS_ARGS.get("last_save_tokens", 0) > ANALYSIS_ARGS["save_interval_tokens"]:
+                        with analysis_utils.ANALYSIS_CACHE_LOCK:
+                            # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
+                            save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=("last_save_tokens" not in ANALYSIS_ARGS), save_info=True, compress=True)
+                        ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
+                else:
                     with analysis_utils.ANALYSIS_CACHE_LOCK:
                         # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
-                        save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=("last_save_tokens" not in ANALYSIS_ARGS), save_info=True, compress=True)
-                    ANALYSIS_ARGS["last_save_tokens"] = ANALYSIS_ARGS.get("recorded_tokens", 0)  # update the last save tokens
-            else:
-                with analysis_utils.ANALYSIS_CACHE_LOCK:
-                    # add a lock here as the generation and saving are asynchronous (this will lag the generation speed, but it's the only way for bug-free recording)
-                    save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=(ANALYSIS_ARGS["batch_id"] == 0), save_info=True, compress=True)
+                        save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=(ANALYSIS_ARGS["batch_id"] == 0), save_info=True, compress=True)
 
         return ret
 
