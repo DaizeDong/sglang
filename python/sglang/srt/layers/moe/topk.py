@@ -34,6 +34,10 @@ except Exception as e:
 
 _is_cuda = is_cuda()
 
+from sglang.srt.managers.utils import ExpertDistributionRecorder
+
+expert_distribution_recorder = ExpertDistributionRecorder()
+
 
 @torch._dynamo.disable
 def record_layer_router_scores(value_name, logits, scores, topk_scores, topk_ids, layer_idx):  # 🔍
@@ -282,5 +286,7 @@ def select_experts(
             topk=top_k,
             renormalize=renormalize,
         )
+
+    expert_distribution_recorder.record_new_token(topk_ids)
 
     return topk_weights, topk_ids
