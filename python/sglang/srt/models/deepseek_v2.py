@@ -372,7 +372,7 @@ class DeepseekV2MoE(nn.Module):
             (0, self.top_k), dtype=torch.float32, device=hidden_states.device
         )
 
-        # TODO: Support EP Analysis
+        # 🔍 TODO: Support EP Analysis
         if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
             raise NotImplementedError("Analysis not supported for EP")
 
@@ -1175,7 +1175,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"] and isinstance(
                     self.mlp, DeepseekV2MoE
                 ):
-                    # TODO: Support EP Analysis
+                    # 🔍 TODO: Support EP Analysis
                     if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
                         raise NotImplementedError("Analysis not supported for EP")
 
@@ -1514,15 +1514,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if _is_hip:
                         self_attn.w_scale *= 2.0
 
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:  # 🔍
-            for layer_idx, decoder in enumerate(self.model.layers):
-                if isinstance(decoder.mlp, DeepseekV2MoE):
-                    record_layer_weights("router_weights", decoder.mlp.gate.weight.data, layer_idx)
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.model.layers):
+                    if isinstance(decoder.mlp, DeepseekV2MoE):
+                        record_layer_weights("router_weights", decoder.mlp.gate.weight.data, layer_idx)
 
-        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
-            for layer_idx, decoder in enumerate(self.model.layers):
-                if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
-                    record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+            if analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.model.layers):
+                    if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                        record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+
+            if analysis_utils.ANALYSIS_ENABLED and "norm_weights" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.transformer.encoder.layers):
+                    record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
+                    record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
