@@ -107,7 +107,7 @@ def record_value(value_name, value):  # 🔍
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
-    if value_name not in ANALYSIS_TYPE:
+    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
         return
     if value is None:
         return
@@ -120,7 +120,7 @@ def record_layer_value(value_name, value, layer_idx):  # 🔍
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
-    if value_name not in ANALYSIS_TYPE:
+    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
         return
     if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
         ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
@@ -134,9 +134,9 @@ def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
     for name, p in [
-        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+        (string, int(re.search(r"activation_magnitude_l(\d+)", string).group(1)))
         for string in ANALYSIS_TYPE
-        if re.search(r"magnitude_l(\d+)", string)
+        if re.search(r"activation_magnitude_l(\d+)", string)
     ]:
         if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
@@ -150,6 +150,22 @@ def record_layer_weights(value_name, value, layer_idx):  # 🔍
     if value_name not in ANALYSIS_CACHE_STATIC:
         ANALYSIS_CACHE_STATIC[value_name] = {}
     ANALYSIS_CACHE_STATIC[value_name][layer_idx] = value.clone().cpu()
+
+
+@torch._dynamo.disable
+def record_layer_weights_magnitude(param_name, value, layer_idx):  # 🔍
+    for name, p in [
+        (string, int(re.search(r"weights_magnitude_l(\d+)", string).group(1)))
+        for string in ANALYSIS_TYPE
+        if re.search(r"weights_magnitude_l(\d+)", string)
+    ]:
+        if name not in ANALYSIS_CACHE_STATIC:
+            ANALYSIS_CACHE_STATIC[name] = {}
+        if layer_idx not in ANALYSIS_CACHE_STATIC[name]:
+            ANALYSIS_CACHE_STATIC[name][layer_idx] = {}
+        pow_value = torch.pow(value.abs(), p)  # take the abs first
+        ANALYSIS_CACHE_STATIC[name][layer_idx][param_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
+
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1515,20 +1531,26 @@ class DeepseekV2ForCausalLM(nn.Module):
                         self_attn.w_scale *= 2.0
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            if analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:
+            if not analysis_utils.ANALYSIS_ENABLED:
+                pass
+            elif ANALYSIS_TYPE is None:
+                pass
+            else:
                 for layer_idx, decoder in enumerate(self.model.layers):
-                    if isinstance(decoder.mlp, DeepseekV2MoE):
-                        record_layer_weights("router_weights", decoder.mlp.gate.weight.data, layer_idx)
+                    if "router_weights" in ANALYSIS_TYPE:
+                        if isinstance(decoder.mlp, DeepseekV2MoE):
+                            record_layer_weights("router_weights", decoder.mlp.gate.weight.data, layer_idx)
 
-            if analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:
-                for layer_idx, decoder in enumerate(self.model.layers):
-                    if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
-                        record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+                    if "router_bias" in ANALYSIS_TYPE:
+                        if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                            record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
 
-            if analysis_utils.ANALYSIS_ENABLED and "norm_weights" in ANALYSIS_TYPE:
-                for layer_idx, decoder in enumerate(self.transformer.encoder.layers):
-                    record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
-                    record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
+                    if "layernorm_weights" in ANALYSIS_TYPE:
+                        record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
+                        record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
+
+                    for param_name, param in decoder.named_parameters():
+                        record_layer_weights_magnitude(param_name, param.data, layer_idx)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

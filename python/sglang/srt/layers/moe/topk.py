@@ -45,7 +45,7 @@ def record_layer_router_scores(value_name, logits, scores, topk_scores, topk_ids
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
-    if value_name not in ANALYSIS_TYPE:
+    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
         return
     if layer_idx is None:
         return
