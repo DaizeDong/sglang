@@ -312,6 +312,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.local_num_experts = num_experts
         self.layer_idx = layer_idx  # 🔍
 
         if quant_config is None:
@@ -637,8 +638,6 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
-            inplace=self.inplace,
-            no_combine=self.no_combine,
             layer_idx=self.layer_idx,  # 🔍
         )
 
