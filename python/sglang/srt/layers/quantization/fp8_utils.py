@@ -171,6 +171,7 @@ def input_to_float8(
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     fp8_max = finfo.max
     if _is_hip:
+        dtype = torch.float8_e4m3fnuz
         fp8_max = 224.0
     scale = fp8_max / amax
     x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
@@ -457,12 +458,9 @@ class Fp8LinearOp:
                 qinput, x_scale = sgl_scaled_fp8_quant(
                     input_2d,
                     input_scale,
+                    num_token_padding=self.output_padding,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
-                if self.output_padding:
-                    pad_size = max(self.output_padding - qinput.shape[0], 0)
-                    if pad_size > 0:
-                        qinput = torch.nn.functional.pad(qinput, (0, 0, 0, pad_size))
             else:
                 qinput, x_scale = ops.scaled_fp8_quant(
                     input_2d,

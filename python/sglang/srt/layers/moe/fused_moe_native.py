@@ -23,10 +23,15 @@ def fused_moe_forward_native(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     inplace: bool = True,
     no_combine: bool = False,
     layer_idx: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
+
+    if apply_router_weight_on_input:
+        raise NotImplementedError
+
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
         router_logits=router_logits,
