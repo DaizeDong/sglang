@@ -26,6 +26,7 @@ def fused_moe_forward_native(
     apply_router_weight_on_input: bool = False,
     inplace: bool = True,
     no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
     layer_idx: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
 
@@ -42,6 +43,7 @@ def fused_moe_forward_native(
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
+        routed_scaling_factor=routed_scaling_factor,
         torch_native=True,
         layer_idx=layer_idx,  # 🔍
     )
@@ -73,6 +75,7 @@ def moe_forward_native(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    routed_scaling_factor: Optional[float] = None,
     layer_idx: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
 
@@ -89,6 +92,7 @@ def moe_forward_native(
         custom_routing_function=custom_routing_function,
         correction_bias=correction_bias,
         torch_native=True,
+        routed_scaling_factor=routed_scaling_factor,
         layer_idx=layer_idx,  # 🔍
     )
 

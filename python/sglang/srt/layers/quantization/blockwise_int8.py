@@ -373,6 +373,7 @@ class BlockInt8MoEMethod:
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
         layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -389,6 +390,7 @@ class BlockInt8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
             layer_idx=layer_idx,  # 🔍
         )
 

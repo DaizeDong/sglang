@@ -1,13 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-
-from sglang.srt.utils import is_cuda_available, set_weight_attrs
-
-is_cuda = is_cuda_available()
-if is_cuda:
-    from sgl_kernel import int8_scaled_mm
-
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -18,6 +11,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.utils import is_cuda, set_weight_attrs
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import int8_scaled_mm
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -233,6 +231,7 @@ class W8A8Int8MoEMethod:
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
         layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -249,6 +248,7 @@ class W8A8Int8MoEMethod:
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
             layer_idx=layer_idx,  # 🔍
         )
 
@@ -262,6 +262,7 @@ class W8A8Int8MoEMethod:
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
+            per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
