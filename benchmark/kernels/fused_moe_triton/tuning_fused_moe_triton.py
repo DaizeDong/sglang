@@ -393,7 +393,7 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Qwen2MoeForCausalLM":
+    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
@@ -487,7 +487,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -522,7 +522,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(

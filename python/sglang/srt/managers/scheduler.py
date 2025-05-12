@@ -21,7 +21,6 @@ import signal
 import sys
 import threading
 import time
-import warnings
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -52,7 +51,12 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
 )
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
@@ -83,6 +87,8 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SlowDownReqInput,
+    SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -115,7 +121,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -125,9 +131,11 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    disable_request_logging,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    point_to_point_pyobj,
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -158,12 +166,14 @@ logger = logging.getLogger(__name__)
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
 @dataclass
 class GenerationBatchResult:
-    logits_output: LogitsProcessorOutput
-    next_token_ids: List[int]
+    logits_output: Optional[LogitsProcessorOutput]
+    pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
@@ -188,12 +198,16 @@ class Scheduler(
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        pp_rank: int,
         dp_rank: Optional[int],
     ):
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
+        self.pp_rank = pp_rank
         self.tp_size = server_args.tp_size
+        self.pp_size = server_args.pp_size
+        self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -209,7 +223,6 @@ class Scheduler(
         self.page_size = server_args.page_size
 
         # Distributed rank info
-        self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -221,7 +234,7 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
-        if self.attn_tp_rank == 0:
+        if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -265,9 +278,6 @@ class Scheduler(
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-        if self.model_config.is_multimodal:
-            self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for multimodal models.")
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -279,6 +289,7 @@ class Scheduler(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
@@ -312,8 +323,18 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
+        if global_server_args_dict["max_micro_batch_size"] is None:
+            global_server_args_dict["max_micro_batch_size"] = max(
+                self.max_running_requests // server_args.pp_size, 1
+            )
+
+        self.tp_group = self.tp_worker.get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+        self.attn_tp_group = self.tp_worker.get_attention_tp_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
+
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
@@ -412,6 +433,8 @@ class Scheduler(
         self.profiler_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
 
+        self.forward_sleep_time = None
+
         # Init metrics stats
         self.init_metrics()
 
@@ -434,6 +457,7 @@ class Scheduler(
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -454,17 +478,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
 
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
+        self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -478,7 +492,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -501,6 +515,7 @@ class Scheduler(
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
             )
         else:
             if self.enable_hierarchical_cache:
@@ -599,6 +614,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
+
+            # Metric for pre-allocation
+            self.num_tokens_pre_allocated = 0
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -614,7 +633,7 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
-            self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=metadata_buffers,
@@ -662,6 +681,7 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -673,7 +693,7 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None)
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -681,7 +701,10 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                self.process_batch_result(tmp_batch, tmp_result)
+                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -689,26 +712,141 @@ class Scheduler(
 
             self.last_batch = batch
 
+    @DynamicGradMode()
+    def event_loop_pp(self):
+        """A non-overlap scheduler loop for pipeline parallelism."""
+        mbs = [None] * self.pp_size
+        last_mbs = [None] * self.pp_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+        ]
+        bids = [None] * self.pp_size
+        pp_outputs: Optional[PPProxyTensors] = None
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_size):
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = last_mbs[mb_id]
+
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                mbs[mb_id] = self.get_next_batch_to_run()
+                self.running_mbs[mb_id] = self.running_batch
+
+                self.cur_batch = mbs[mb_id]
+                if self.cur_batch:
+                    server_is_idle = False
+                    result = self.run_batch(self.cur_batch)
+
+                # send the outputs to the next step
+                if self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        next_token_ids, bids[mb_id] = (
+                            result.next_token_ids,
+                            result.bid,
+                        )
+                        pp_outputs = PPProxyTensors(
+                            {
+                                "next_token_ids": next_token_ids,
+                            }
+                        )
+                        # send the output from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs = None
+                if mbs[next_mb_id] is not None:
+                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    output_result = GenerationBatchResult(
+                        logits_output=None,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=None,
+                        extend_logprob_start_len_per_req=None,
+                        bid=bids[next_mb_id],
+                    )
+                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                # carry the outputs to the next stage
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        bids[mb_id] = result.bid
+                    if pp_outputs:
+                        # send the outputs from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                if not self.pp_group.is_last_rank:
+                    # send out reqs to the next stage
+                    dp_offset = self.dp_rank * self.attn_tp_size
+                    if self.attn_tp_rank == 0:
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                pp_outputs = next_pp_outputs
+
+            # When the server is idle, self-check and re-init some states
+            if server_is_idle:
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        if self.attn_tp_rank == 0:
-            recv_reqs = []
+        if self.pp_rank == 0:
+            if self.attn_tp_rank == 0:
+                recv_reqs = []
 
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_req)
+                while True:
+                    try:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
 
-            while True:
-                try:
-                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_rpc)
+                while True:
+                    try:
+                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_rpc)
+            else:
+                recv_reqs = None
         else:
-            recv_reqs = None
+            if self.attn_tp_rank == 0:
+                dp_offset = self.dp_rank * self.attn_tp_size
+                recv_reqs = point_to_point_pyobj(
+                    [],
+                    self.pp_rank * self.tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    (self.pp_rank - 1) * self.tp_size + dp_offset,
+                    self.pp_rank * self.tp_size + dp_offset,
+                )
+            else:
+                recv_reqs = None
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -731,20 +869,27 @@ class Scheduler(
                 control_reqs = None
 
             if self.attn_tp_size != 1:
-                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
                 work_reqs = broadcast_pyobj(
                     work_reqs,
-                    self.attn_tp_rank,
+                    self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
-                    src=attn_tp_rank_0,
+                    src=self.attn_tp_group.ranks[0],
                 )
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
+                    control_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -780,18 +925,9 @@ class Scheduler(
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
 
-            # Handle custom logit processor passed to the request
-            custom_logit_processor = recv_req.custom_logit_processor
-            if (
-                not self.server_args.enable_custom_logit_processor
-                and custom_logit_processor is not None
-            ):
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-                custom_logit_processor = None
+            if recv_req.bootstrap_port is None:
+                # Use default bootstrap port
+                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
             req = Req(
                 recv_req.rid,
@@ -804,10 +940,11 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
-                custom_logit_processor=custom_logit_processor,
+                custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
@@ -909,12 +1046,15 @@ class Scheduler(
             elif req.sampling_params.structural_tag:
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
-            req.grammar = self.grammar_backend.get_cached_value(key)
-            if not req.grammar:
-                req.grammar = self.grammar_backend.get_future_value(key)
+            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+            req.grammar = value
+
+            if not cache_hit:
+                req.grammar_key = key
                 add_to_grammar_queue = True
 
         if add_to_grammar_queue:
+            req.queue_time_start = time.time()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
@@ -922,7 +1062,7 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_pending_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(req)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
@@ -1012,8 +1152,15 @@ class Scheduler(
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
         )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+        else:
+            f += f"#queue-req: {len(self.waiting_queue)}"
+
         logger.info(f)
 
         if self.enable_metrics:
@@ -1033,12 +1180,14 @@ class Scheduler(
 
             self.metrics_collector.log_stats(self.stats)
 
-    def log_decode_stats(self):
+    def log_decode_stats(self, running_batch=None):
+        batch = running_batch or self.running_batch
+
         gap_latency = time.time() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.time()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
-        num_running_reqs = len(self.running_batch.reqs)
+        num_running_reqs = len(batch.reqs)
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
@@ -1049,15 +1198,14 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        msg = (
+            f"Decode batch. "
+            f"#running-req: {num_running_reqs}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
+
         if self.spec_algorithm.is_none():
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
             spec_accept_length = 0
         else:
             spec_accept_length = (
@@ -1066,15 +1214,15 @@ class Scheduler(
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"accept len: {spec_accept_length:.2f}, "
-                f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"#queue-req: {len(self.waiting_queue)}, "
-            )
+            msg += f"accept len: {spec_accept_length:.2f}, "
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+
+        msg += (
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}"
+        )
 
         logger.info(msg)
         if self.enable_metrics:
@@ -1084,6 +1232,7 @@ class Scheduler(
             self.stats.cache_hit_rate = 0.0
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
 
@@ -1105,9 +1254,7 @@ class Scheduler(
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
@@ -1115,9 +1262,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            warnings.warn(msg)
-            if crash_on_warnings():
-                raise ValueError(msg)
+            raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1135,23 +1280,30 @@ class Scheduler(
             self.stats.token_usage = num_used / self.max_total_num_tokens
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.metrics_collector.log_stats(self.stats)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            # Move the chunked request out of the batch so that we can merge
+            # only finished requests to running_batch.
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            # chunked request keeps its rid but will get a new req_pool_idx
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.chunked_req:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req)
-                # chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
-                self.running_batch.batch_is_full = False
+            if self.last_batch.chunked_req is not None:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -1181,6 +1333,12 @@ class Scheduler(
 
         return ret
 
+    def get_num_allocatable_reqs(self, running_bs):
+        res = global_server_args_dict["max_micro_batch_size"] - running_bs
+        if self.pp_size > 1:
+            res = min(res, self.req_to_token_pool.available_size())
+        return res
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
@@ -1193,7 +1351,12 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        if running_bs >= self.max_running_requests:
+        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked request has just been released.
+        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
             self.running_batch.batch_is_full = True
             return None
 
@@ -1237,7 +1400,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
                 break
 
@@ -1249,16 +1412,14 @@ class Scheduler(
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
+
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
-                        ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                        ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1301,6 +1462,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            chunked_req=self.chunked_req,
         )
         new_batch.prepare_for_extend()
 
@@ -1374,13 +1536,22 @@ class Scheduler(
         ):
             self.stop_profile()
 
+        if self.forward_sleep_time is not None:
+            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
+            time.sleep(self.forward_sleep_time)
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+                if self.pp_group.is_last_rank:
+                    logits_output, next_token_ids = (
+                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                    )
+                else:
+                    pp_hidden_states_proxy_tensors, _ = (
+                        self.tp_worker.forward_batch_generation(model_worker_batch)
+                    )
                 bid = model_worker_batch.bid
             else:
                 (
@@ -1394,7 +1565,9 @@ class Scheduler(
                 )
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
-            batch.output_ids = next_token_ids
+
+            if self.pp_group.is_last_rank:
+                batch.output_ids = next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -1409,8 +1582,13 @@ class Scheduler(
                 extend_logprob_start_len_per_req = None
 
             ret = GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
+                logits_output=logits_output if self.pp_group.is_last_rank else None,
+                pp_hidden_states_proxy_tensors=(
+                    pp_hidden_states_proxy_tensors
+                    if not self.pp_group.is_last_rank
+                    else None
+                ),
+                next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
@@ -1450,14 +1628,15 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_batch_result(result.bid)
+                self.tp_worker.resolve_last_batch_result(launch_done)
                 if batch.next_batch_sampling_info:
                     batch.next_batch_sampling_info.update_regex_vocab_mask()
                     self.current_stream.synchronize()
@@ -1583,12 +1762,19 @@ class Scheduler(
 
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
+
         num_ready_reqs = 0
+        num_abort_reqs = 0
         for req in self.grammar_queue:
             try:
-                req.grammar = req.grammar.result(timeout=0.05)
+                req.grammar = req.grammar.result(timeout=0.03)
+                if req.grammar:
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
+                req.grammar_wait_ct += 1
+                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                    num_abort_reqs = 1
                 break
 
         if self.server_args.enable_dp_attention:
@@ -1600,14 +1786,28 @@ class Scheduler(
 
         if tp_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+            tensor = torch.tensor([num_ready_reqs, num_abort_reqs], dtype=torch.int32)
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
-            num_ready_reqs_max = tensor.item()
+            num_ready_reqs_max, num_abort_reqs_max = tensor.tolist()
+
             for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+                req = self.grammar_queue[i]
+                req.grammar = req.grammar.result()
+                if req.grammar:
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+
+            for i in range(num_ready_reqs, num_ready_reqs + num_abort_reqs_max):
+                req = self.grammar_queue[i]
+                req.grammar.cancel()
+                req.grammar = None
+                error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+                logger.error(error_msg)
+                req.finished_reason = FINISH_ABORT(
+                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+            num_ready_reqs = num_ready_reqs_max + num_abort_reqs_max
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
@@ -1622,24 +1822,27 @@ class Scheduler(
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
-                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
                         break
                 else:
                     self.watchdog_last_forward_ct = self.forward_ct
                     self.watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
-        # Print batch size and memory pool info to check whether there are de-sync issues.
-        logger.error(
-            f"{self.cur_batch.batch_size()=}, "
-            f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool_allocator.available_size()=}, "
-            f"{self.tree_cache.evictable_size()=}, "
-        )
-        # Wait for some time so that the parent process can print the error.
+        if not disable_request_logging():
+            # Print batch size and memory pool info to check whether there are de-sync issues.
+            logger.error(
+                f"{self.cur_batch.batch_size()=}, "
+                f"{self.cur_batch.reqs=}, "
+                f"{self.token_to_kv_pool_allocator.available_size()=}, "
+                f"{self.tree_cache.evictable_size()=}, "
+            )
+
         pyspy_dump_schedulers()
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
+
+        # Wait for some time so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
@@ -1649,7 +1852,11 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if len(self.waiting_queue) == 0 and self.running_batch.is_empty():
+        if (
+            len(self.waiting_queue) == 0
+            and self.running_batch.is_empty()
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        ):
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -1687,7 +1894,6 @@ class Scheduler(
             ret["avg_spec_accept_length"] = (
                 self.cum_spec_accept_length / self.cum_spec_accept_count
             )
-
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
         return GetInternalStateReqOutput(
@@ -1698,6 +1904,7 @@ class Scheduler(
         server_args_dict = recv_req.server_args
         args_allow_update = set(
             [
+                "max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
             ]
@@ -1706,6 +1913,14 @@ class Scheduler(
         for k, v in server_args_dict.items():
             if k not in args_allow_update:
                 logging.warning(f"Updating {k} is not supported.")
+                if_success = False
+                break
+            elif k == "max_micro_batch_size" and (
+                v > self.max_running_requests // self.pp_size or v < 1
+            ):
+                logging.warning(
+                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.pp_size}]."
+                )
                 if_success = False
                 break
         if if_success:
@@ -1759,25 +1974,30 @@ class Scheduler(
         )
 
     def abort_request(self, recv_req: AbortReq):
+        # TODO(lmzheng): abort the requests in the grammar queue.
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if req.rid.startswith(recv_req.rid):
                 to_del.append(i)
-                break
 
         # Sort in reverse order to avoid index issues when deleting
-        for i in sorted(to_del, reverse=True):
+        for i in reversed(to_del):
             req = self.waiting_queue.pop(i)
+            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
-            return
 
         # Delete requests in the running batch
-        for req in self.running_batch.reqs:
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
+        else:
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
+
+        for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_abort = True
-                return
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -1845,6 +2065,13 @@ class Scheduler(
         )
         del self.stashed_model_static_state
         return ResumeMemoryOccupationReqOutput()
+
+    def slow_down(self, recv_req: SlowDownReqInput):
+        t = recv_req.forward_sleep_time
+        if t is not None and t <= 0:
+            t = None
+        self.forward_sleep_time = t
+        return SlowDownReqOutput()
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
@@ -1989,6 +2216,16 @@ class Scheduler(
         else:
             del self.sessions[session_id]
 
+    def get_print_prefix(self):
+        prefix = ""
+        if self.dp_rank is not None:
+            prefix += f" DP{self.dp_rank}"
+        if self.server_args.tp_size > 1:
+            prefix += f" TP{self.tp_rank}"
+        if self.pp_size > 1:
+            prefix += f" PP{self.pp_rank}"
+        return prefix
+
 
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
@@ -2013,14 +2250,18 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
 ):
     # Generate the prefix
-    if dp_rank is None:
-        prefix = f" TP{tp_rank}"
-    else:
-        prefix = f" DP{dp_rank} TP{tp_rank}"
+    prefix = ""
+    if dp_rank is not None:
+        prefix += f" DP{dp_rank}"
+    if server_args.tp_size > 1:
+        prefix += f" TP{tp_rank}"
+    if server_args.pp_size > 1:
+        prefix += f" PP{pp_rank}"
 
     # Config the process
     kill_itself_when_parent_died()
@@ -2042,7 +2283,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2053,14 +2294,23 @@ def run_scheduler_process(
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
 
         if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_overlap:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_pp()
+            elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
             else:
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
-            scheduler.event_loop_normal_disagg_prefill()
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_prefill()
+            else:
+                scheduler.event_loop_normal_disagg_prefill()
+
         elif disaggregation_mode == DisaggregationMode.DECODE:
-            scheduler.event_loop_normal_disagg_decode()
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_decode()
+            else:
+                scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()
