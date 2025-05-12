@@ -312,6 +312,7 @@ def biased_grouped_topk(
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
     routed_scaling_factor: Optional[float] = None,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     assert (
         routed_scaling_factor is not None
@@ -350,6 +351,7 @@ def biased_grouped_topk(
             topk_group,
             n_share_experts_fusion=n_share_experts_fusion,
             routed_scaling_factor=routed_scaling_factor,
+            layer_idx=layer_idx,  # 🔍
         )
 
 

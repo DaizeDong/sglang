@@ -422,8 +422,6 @@ class DeepseekV2MoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         if not ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:
@@ -1247,7 +1245,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.layer_idx = layer_id  # 🔍
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
         self.dp_size = get_attention_dp_size()
@@ -1368,7 +1365,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
             if ANALYSIS_MODULE_LOADED:  # 🔍
-                record_layer_magnitude("attn_residual", residual, self.layer_idx)
+                record_layer_magnitude("attn_residual", residual, self.layer_id)
 
             assert not (
                 self.attn_tp_size != 1 and self.input_is_scattered
@@ -1396,24 +1393,24 @@ class DeepseekV2DecoderLayer(nn.Module):
                 dp_scatter(residual, hidden_states, forward_batch)
 
                 if ANALYSIS_MODULE_LOADED:  # 🔍
-                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
-                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
+                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
                 hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
                 if ANALYSIS_MODULE_LOADED:  # 🔍
-                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
-                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
+                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
         else:
             if ANALYSIS_MODULE_LOADED:  # 🔍
-                record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
-                record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+                record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
+                record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
@@ -1421,7 +1418,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_residual", residual, self.layer_idx)
+            record_layer_magnitude("mlp_residual", residual, self.layer_id)
 
         hidden_states = self.mlp(hidden_states)
 
@@ -1437,8 +1434,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_outputs", hidden_states, self.layer_idx)
-            record_layer_magnitude("mlp_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+            record_layer_magnitude("mlp_outputs", hidden_states, self.layer_id)
+            record_layer_magnitude("mlp_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
         return hidden_states, residual
 
