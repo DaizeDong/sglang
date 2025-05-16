@@ -16,7 +16,6 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 import math
-import re
 import logging
 import os
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from sglang.srt.analysis_record import record_layer_activation_magnitude, record_layer_value, record_layer_weights, record_layer_weights_magnitude, record_value
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -128,77 +128,6 @@ except Exception as e:
     ANALYSIS_MODULE_LOADED = False
 
 logger = logging.getLogger(__name__)
-
-
-@torch._dynamo.disable
-def record_value(value_name, value):  # 🔍
-    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
-    if not analysis_utils.ANALYSIS_ENABLED:
-        return
-    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
-        return
-    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
-        return
-    if value is None:
-        return
-    ANALYSIS_CACHE_DYNAMIC[-1][value_name] = value.clone().cpu()
-
-
-@torch._dynamo.disable
-def record_layer_value(value_name, value, layer_idx):  # 🔍
-    if not analysis_utils.ANALYSIS_ENABLED:
-        return
-    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
-        return
-    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
-        return
-    if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-        ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
-    ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = value.clone().cpu()
-
-
-@torch._dynamo.disable
-def record_layer_activation_magnitude(value_name, value, layer_idx):  # 🔍
-    if not analysis_utils.ANALYSIS_ENABLED:
-        return
-    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
-        return
-    for name, p in [
-        (string, int(re.search(r"activation_magnitude_l(\d+)", string).group(1)))
-        for string in ANALYSIS_TYPE
-        if re.search(r"activation_magnitude_l(\d+)", string)
-    ]:
-        if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-        if layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-            ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx] = {}
-        # element value magnitude
-        pow_value = torch.pow(value.abs(), p)  # take the abs first
-        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
-        # vector length
-        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx]["vector#" + value_name] = torch.norm(value, p=p, dim=-1, dtype=torch.float32).cpu()
-
-
-@torch._dynamo.disable
-def record_layer_weights(value_name, value, layer_idx):  # 🔍
-    if value_name not in ANALYSIS_CACHE_STATIC:
-        ANALYSIS_CACHE_STATIC[value_name] = {}
-    ANALYSIS_CACHE_STATIC[value_name][layer_idx] = value.clone().cpu()
-
-
-@torch._dynamo.disable
-def record_layer_weights_magnitude(param_name, value, layer_idx):  # 🔍
-    for name, p in [
-        (string, int(re.search(r"weights_magnitude_l(\d+)", string).group(1)))
-        for string in ANALYSIS_TYPE
-        if re.search(r"weights_magnitude_l(\d+)", string)
-    ]:
-        if name not in ANALYSIS_CACHE_STATIC:
-            ANALYSIS_CACHE_STATIC[name] = {}
-        if layer_idx not in ANALYSIS_CACHE_STATIC[name]:
-            ANALYSIS_CACHE_STATIC[name][layer_idx] = {}
-        pow_value = torch.pow(value.abs(), p)  # take the abs first
-        ANALYSIS_CACHE_STATIC[name][layer_idx][param_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
 
 
 class AttnForwardMethod(IntEnum):
