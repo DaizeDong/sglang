@@ -158,7 +158,7 @@ def record_layer_value(value_name, value, layer_idx):  # 🔍
 
 
 @torch._dynamo.disable
-def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
+def record_layer_activation_magnitude(value_name, value, layer_idx):  # 🔍
     if not analysis_utils.ANALYSIS_ENABLED:
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
@@ -172,7 +172,11 @@ def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
         if layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
             ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = torch.norm(value, p=p, dim=-1, dtype=torch.float32).cpu()
+        # element value magnitude
+        pow_value = torch.pow(value.abs(), p)  # take the abs first
+        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
+        # vector length
+        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx]["vector#" + value_name] = torch.norm(value, p=p, dim=-1, dtype=torch.float32).cpu()
 
 
 @torch._dynamo.disable
@@ -403,7 +407,7 @@ class DeepseekV2MoE(nn.Module):
             if shared_output is not None:
                 if self.tp_size > 1:  # reduce ahead for accurate recording
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
+                record_layer_activation_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
             else:
                 # 🔍 TODO: Support Shared Expert Fusion
                 raise NotImplementedError("Analysis not supported for Shared Expert Fusion")
@@ -418,7 +422,7 @@ class DeepseekV2MoE(nn.Module):
         if ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:  # reduce ahead for accurate recording
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1365,7 +1369,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
             if ANALYSIS_MODULE_LOADED:  # 🔍
-                record_layer_magnitude("attn_residual", residual, self.layer_id)
+                record_layer_activation_magnitude("attn_residual", residual, self.layer_id)
 
             assert not (
                 self.attn_tp_size != 1 and self.input_is_scattered
@@ -1393,24 +1397,24 @@ class DeepseekV2DecoderLayer(nn.Module):
                 dp_scatter(residual, hidden_states, forward_batch)
 
                 if ANALYSIS_MODULE_LOADED:  # 🔍
-                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
-                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
+                    record_layer_activation_magnitude("attn_outputs", hidden_states, self.layer_id)
+                    record_layer_activation_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
                 hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
                 if ANALYSIS_MODULE_LOADED:  # 🔍
-                    record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
-                    record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
+                    record_layer_activation_magnitude("attn_outputs", hidden_states, self.layer_id)
+                    record_layer_activation_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
         else:
             if ANALYSIS_MODULE_LOADED:  # 🔍
-                record_layer_magnitude("attn_outputs", hidden_states, self.layer_id)
-                record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
+                record_layer_activation_magnitude("attn_outputs", hidden_states, self.layer_id)
+                record_layer_activation_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
@@ -1418,7 +1422,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_residual", residual, self.layer_id)
+            record_layer_activation_magnitude("mlp_residual", residual, self.layer_id)
 
         hidden_states = self.mlp(hidden_states)
 
@@ -1434,8 +1438,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_outputs", hidden_states, self.layer_id)
-            record_layer_magnitude("mlp_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
+            record_layer_activation_magnitude("mlp_outputs", hidden_states, self.layer_id)
+            record_layer_activation_magnitude("mlp_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_id)
 
         return hidden_states, residual
 
