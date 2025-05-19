@@ -62,7 +62,9 @@ def record_layer_activation_magnitude(value_name, value, layer_idx):  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx] = {}
         # element value magnitude
         pow_value = torch.pow(value.abs(), p)  # take the abs first
-        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
+        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = (
+            pow_value.min(dim=0).values.cpu(), pow_value.mean(dim=0).cpu(), pow_value.max(dim=0).values.cpu()
+        )  # calculate the min, mean and max
         # vector length
         ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx]["vector#" + value_name] = torch.norm(value, p=p, dim=-1, dtype=torch.float32).cpu()
 
