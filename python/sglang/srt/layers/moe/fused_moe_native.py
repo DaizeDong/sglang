@@ -28,7 +28,7 @@ def fused_moe_forward_native(
     inplace: bool = True,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    layer_idx: Optional[int] = None,  # 🔍
+    layer_id: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
 
     if apply_router_weight_on_input:
@@ -46,7 +46,7 @@ def fused_moe_forward_native(
         correction_bias=correction_bias,
         routed_scaling_factor=routed_scaling_factor,
         torch_native=True,
-        layer_idx=layer_idx,  # 🔍
+        layer_id=layer_id,  # 🔍
     )
 
     w13_weights = layer.w13_weight[topk_ids]
@@ -77,7 +77,7 @@ def moe_forward_native(
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
     routed_scaling_factor: Optional[float] = None,
-    layer_idx: Optional[int] = None,  # 🔍
+    layer_id: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
@@ -91,7 +91,7 @@ def moe_forward_native(
         correction_bias=correction_bias,
         torch_native=True,
         routed_scaling_factor=routed_scaling_factor,
-        layer_idx=layer_idx,  # 🔍
+        layer_id=layer_id,  # 🔍
     )
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589

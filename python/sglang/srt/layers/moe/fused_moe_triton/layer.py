@@ -134,7 +134,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        layer_idx: Optional[int] = None,  # 🔍
+        layer_id: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -152,7 +152,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
-            layer_idx=layer_idx,  # 🔍
+            layer_id=layer_id,  # 🔍
         )
 
     def forward_cuda(
@@ -172,7 +172,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        layer_idx: Optional[int] = None,  # 🔍
+        layer_id: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -185,7 +185,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
-            layer_idx=layer_idx,  # 🔍
+            layer_id=layer_id,  # 🔍
         )
 
         if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
@@ -239,7 +239,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
-        layer_idx: Optional[int] = None,  # 🔍
+        layer_id: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -252,7 +252,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group,
             custom_routing_function,
             correction_bias,
-            layer_idx=layer_idx,  # 🔍
+            layer_id=layer_id,  # 🔍
         )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
@@ -289,6 +289,7 @@ class FusedMoE(torch.nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: Optional[int] = None,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         renormalize: bool = True,
@@ -306,7 +307,6 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        layer_idx: Optional[int] = None,  # 🔍
     ):
         super().__init__()
 
@@ -336,7 +336,7 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
         self.local_num_experts = num_experts
-        self.layer_idx = layer_idx  # 🔍
+        self.layer_id = layer_id  # 🔍
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -663,7 +663,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             routed_scaling_factor=self.routed_scaling_factor,
-            layer_idx=self.layer_idx,  # 🔍
+            layer_id=self.layer_id,  # 🔍
         )
 
         if self.reduce_results and self.tp_size > 1:
