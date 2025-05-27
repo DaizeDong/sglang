@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.analysis_record import record_layer_balance_loss, record_layer_router_scores
+from sglang.srt.managers import expert_location_dispatch
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
@@ -86,6 +87,7 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     layer_id: Optional[int] = None,  # 🔍
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
@@ -110,6 +112,7 @@ def fused_topk(
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
     if ANALYSIS_MODULE_LOADED:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
@@ -304,6 +307,8 @@ def biased_grouped_topk(
         # TODO merge into kernel for this branch
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         # TODO will fuse this into kernel, thus use slow manual operation now
+        if num_token_non_padded is None:
+            return topk_weights, topk_ids
         torch.compile(
             _mask_topk_ids_padded_region, dynamic=True, backend=get_compiler_backend()
         )(topk_ids, num_token_non_padded)
@@ -349,6 +354,15 @@ def select_experts(
     layer_id: Optional[int] = None,  # 🔍
 ):
     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+
+    router_logits, correction_bias = (
+        expert_location_dispatch.transform_select_experts_inputs(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            info=expert_location_dispatch_info,
+        )
+    )
+
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
@@ -398,12 +412,13 @@ def select_experts(
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk"
-        assert expert_location_dispatch_info is None
+        # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            expert_location_dispatch_info=expert_location_dispatch_info,
             layer_id=layer_id,  # 🔍
         )
     else:
