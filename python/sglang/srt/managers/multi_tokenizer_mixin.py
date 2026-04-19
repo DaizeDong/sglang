@@ -56,6 +56,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_field_by_index(output, field_name: str, index: int, check_length: bool = True):
+    values = getattr(output, field_name, None)
+    if values is None:
+        return None
+    if check_length and len(values) <= index:
+        return None
+    if len(values) <= index:
+        return None
+    return [values[index]]
+
+
 class SocketMapping:
     def __init__(self):
         self._zmq_context = zmq.Context()
@@ -202,8 +213,28 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
+            output_routed_experts=_extract_field_by_index(
+                output, "output_routed_experts", i, check_length=False
+            ),
+            output_router_inputs=_extract_field_by_index(
+                output, "output_router_inputs", i, check_length=False
+            ),
+            output_router_logits=_extract_field_by_index(
+                output, "output_router_logits", i, check_length=False
+            ),
+            output_router_bias=_extract_field_by_index(
+                output, "output_router_bias", i, check_length=False
+            ),
+            output_router_token_positions=_extract_field_by_index(
+                output, "output_router_token_positions", i, check_length=False
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=(
+                [output.retraction_counts[i]]
+                if len(output.retraction_counts) > i
+                else None
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -292,6 +323,18 @@ def _handle_output_by_index(output, i):
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
+            ),
+            output_router_inputs=_extract_field_by_index(
+                output, "output_router_inputs", i, check_length=False
+            ),
+            output_router_logits=_extract_field_by_index(
+                output, "output_router_logits", i, check_length=False
+            ),
+            output_router_bias=_extract_field_by_index(
+                output, "output_router_bias", i, check_length=False
+            ),
+            output_router_token_positions=_extract_field_by_index(
+                output, "output_router_token_positions", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

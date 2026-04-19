@@ -532,6 +532,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_router_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -741,6 +742,12 @@ class Req(ReqDllmMixin):
         )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
+        # capture router inputs, logits, and bias (delta_logits from bias_predictor)
+        self.return_router_states = return_router_states
+        self.router_inputs: Optional[torch.Tensor] = None
+        self.router_logits: Optional[torch.Tensor] = None
+        self.router_bias: Optional[torch.Tensor] = None
+        self.router_token_positions: Optional[torch.Tensor] = None
 
         # Embedding (return values)
         self.embedding = None
@@ -1108,6 +1115,10 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.router_inputs = None
+        self.router_logits = None
+        self.router_bias = None
+        self.router_token_positions = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1311,6 +1322,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    # Whether to return router inputs and logits
+    return_router_states: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1358,6 +1372,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_router_states=any(req.return_router_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,

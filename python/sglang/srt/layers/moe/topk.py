@@ -48,6 +48,9 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.router_inputs_logits_capturer import (
+    get_global_router_states_capturer,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -213,6 +216,7 @@ class TopK(MultiPlatformOp):
         top_k: int,
         *,
         layer_id: Optional[int] = None,
+        bias_predictor: Optional[torch.nn.Linear] = None,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -235,6 +239,7 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self.bias_predictor = bias_predictor
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -251,6 +256,26 @@ class TopK(MultiPlatformOp):
             scoring_func=scoring_func,
         )
 
+    def _apply_predictive_bias_and_capture(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        delta_logits = None
+        if self.bias_predictor is not None:
+            delta_logits = self.bias_predictor(hidden_states)
+
+        get_global_router_states_capturer().capture(
+            layer_id=self.layer_id,
+            router_inputs=hidden_states,
+            router_logits=router_logits,
+            router_bias=delta_logits,
+        )
+
+        if delta_logits is None:
+            return router_logits
+        return router_logits + delta_logits
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -265,6 +290,7 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
+            bias_predictor=self.bias_predictor,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
@@ -290,6 +316,9 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
+            router_logits = self._apply_predictive_bias_and_capture(
+                hidden_states, router_logits
+            )
             # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
                 router_logits,
@@ -298,6 +327,9 @@ class TopK(MultiPlatformOp):
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         elif output_format == TopKOutputFormat.BYPASSED:
+            router_logits = self._apply_predictive_bias_and_capture(
+                hidden_states, router_logits
+            )
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -315,6 +347,7 @@ class TopK(MultiPlatformOp):
                     layer_id=self.layer_id,
                     router_logits=router_logits,
                     topk_config=self.topk_config,
+                    bias_predictor=self.bias_predictor,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
@@ -333,6 +366,7 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
+            bias_predictor=self.bias_predictor,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
@@ -919,9 +953,24 @@ def select_experts(
     topk_config: TopKConfig,
     *,
     layer_id: Optional[int] = None,
+    bias_predictor: Optional[torch.nn.Linear] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
+
+    # Apply bias correction for predictive routing replay (compute before capture)
+    delta_logits = None
+    if bias_predictor is not None:
+        delta_logits = bias_predictor(hidden_states)
+        router_logits = router_logits + delta_logits
+
+    # Capture original router states (inputs/logits BEFORE bias correction, plus bias if available)
+    get_global_router_states_capturer().capture(
+        layer_id=layer_id,
+        router_inputs=hidden_states,
+        router_logits=router_logits - delta_logits if delta_logits is not None else router_logits,  # Original logits
+        router_bias=delta_logits,
+    )
 
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk

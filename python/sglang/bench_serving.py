@@ -606,6 +606,7 @@ async def async_request_sglang_generate(
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
+            "return_router_states": args.return_router_states,
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
@@ -3180,6 +3181,11 @@ if __name__ == "__main__":
         "--return-routed-experts",
         action="store_true",
         help="Return routed experts.",
+    )
+    parser.add_argument(
+        "--return-router-states",
+        action="store_true",
+        help="Return router states.",
     )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(

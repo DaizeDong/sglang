@@ -125,6 +125,10 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _debug_router_states_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_ROUTER_STATES", "").lower() in {"1", "true", "yes", "on"}
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -501,6 +505,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
+        if request and "trace_context" in request.headers:
+            trace_set_remote_propagate_context(request.headers["trace_context"])
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -582,6 +588,55 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # For true batches, return as-is
         return input_ids, token_type_ids
+
+    @staticmethod
+    def _router_state_payload_present(value) -> bool:
+        return value is not None and not (isinstance(value, str) and value == "")
+
+    def _get_router_state_quartet_for_sample(self, recv_obj, index: int):
+        router_inputs_all = getattr(recv_obj, "output_router_inputs", None)
+        router_logits_all = getattr(recv_obj, "output_router_logits", None)
+        router_bias_all = getattr(recv_obj, "output_router_bias", None)
+        router_token_positions_all = getattr(recv_obj, "output_router_token_positions", None)
+
+        if (
+            router_inputs_all is None
+            and router_logits_all is None
+            and router_bias_all is None
+            and router_token_positions_all is None
+        ):
+            return None, None, None, None
+
+        router_inputs = router_inputs_all[index] if router_inputs_all is not None else None
+        router_logits = router_logits_all[index] if router_logits_all is not None else None
+        router_bias = router_bias_all[index] if router_bias_all is not None else None
+        router_token_positions = (
+            router_token_positions_all[index]
+            if router_token_positions_all is not None
+            else None
+        )
+        present = [
+            self._router_state_payload_present(router_inputs),
+            self._router_state_payload_present(router_logits),
+            self._router_state_payload_present(router_bias),
+            self._router_state_payload_present(router_token_positions),
+        ]
+        if not any(present):
+            return None, None, None, None
+        if not all(present):
+            rid = recv_obj.rids[index] if getattr(recv_obj, "rids", None) else f"index={index}"
+            logger.warning(
+                "[RouterStates] Inconsistent router-state quartet in tokenizer for rid=%s: "
+                "inputs_present=%s logits_present=%s bias_present=%s token_positions_present=%s. "
+                "Dropping router states for this request.",
+                rid,
+                present[0],
+                present[1],
+                present[2],
+                present[3],
+            )
+            return None, None, None, None
+        return router_inputs, router_logits, router_bias, router_token_positions
 
     async def _tokenize_texts(
         self, texts: Union[str, List[str]], is_cross_encoder: bool = False
@@ -940,6 +995,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_router_states=obj.return_router_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -947,6 +1003,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
             )
+            if _debug_router_states_enabled():
+                logger.warning(
+                    "[RouterStates] Tokenizer created tokenized request rid=%s return_router_states=%s "
+                    "return_routed_experts=%s",
+                    tokenized_obj.rid,
+                    tokenized_obj.return_router_states,
+                    tokenized_obj.return_routed_experts,
+                )
+                print(
+                    "[RouterStates] Tokenizer created tokenized request "
+                    f"rid={tokenized_obj.rid} return_router_states={tokenized_obj.return_router_states} "
+                    f"return_routed_experts={tokenized_obj.return_routed_experts}",
+                    flush=True,
+                )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
@@ -1084,6 +1154,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+            router_state_count = sum(t.return_router_states for t in tokenized_objs)
+            routed_expert_count = sum(t.return_routed_experts for t in tokenized_objs)
+            if _debug_router_states_enabled():
+                print(
+                    "[RouterStates] Tokenizer dispatch batch "
+                    f"size={len(tokenized_objs)} router_state_reqs={router_state_count} "
+                    f"routed_expert_reqs={routed_expert_count} first_rid={tokenized_objs[0].rid}",
+                    flush=True,
+                )
+                logger.warning(
+                    "[RouterStates] Tokenizer dispatch batch size=%s router_state_reqs=%s routed_expert_reqs=%s first_rid=%s",
+                    len(tokenized_objs),
+                    router_state_count,
+                    routed_expert_count,
+                    tokenized_objs[0].rid,
+                )
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
@@ -1546,6 +1632,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
+
+            router_inputs, router_logits, router_bias, router_token_positions = (
+                self._get_router_state_quartet_for_sample(recv_obj, i)
+            )
+            if router_inputs is not None:
+                rid = recv_obj.rids[i] if getattr(recv_obj, "rids", None) else f"index={i}"
+                if _debug_router_states_enabled():
+                    print(
+                        f"[RouterStates] Tokenizer meta_info rid={rid} payload_sizes="
+                        f"({len(router_inputs)}, {len(router_logits)}, {len(router_bias)}, {len(router_token_positions)})",
+                        flush=True,
+                    )
+                meta_info["router_inputs"] = router_inputs
+                meta_info["router_logits"] = router_logits
+                meta_info["router_bias"] = router_bias
+                meta_info["router_token_positions"] = router_token_positions
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

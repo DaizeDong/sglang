@@ -150,6 +150,11 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=vocab_size,
+            return_hidden_states=req.return_hidden_states,
+            return_routed_experts=req.return_routed_experts,
+            return_router_states=req.return_router_states,
+            priority=req.priority,
+            extra_key=req.extra_key,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

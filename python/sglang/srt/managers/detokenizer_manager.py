@@ -189,7 +189,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         space_list: List[bool],
     ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
-
         assert self.tokenizer is not None
 
         # fast path
@@ -221,6 +220,158 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 results[idx] = text
 
         return results
+
+    def _normalize_router_state_quartets(self, recv_obj: BatchTokenIDOutput):
+        output_router_inputs = recv_obj.output_router_inputs
+        output_router_logits = recv_obj.output_router_logits
+        output_router_bias = recv_obj.output_router_bias
+        output_router_token_positions = recv_obj.output_router_token_positions
+
+        if (
+            output_router_inputs is None
+            and output_router_logits is None
+            and output_router_bias is None
+            and output_router_token_positions is None
+        ):
+            return None, None, None, None
+
+        if not (
+            output_router_inputs is not None
+            and output_router_logits is not None
+            and output_router_bias is not None
+            and output_router_token_positions is not None
+        ):
+            logger.warning(
+                "[RouterStates] Batch-level router-state mismatch in detokenizer: "
+                "inputs_present=%s logits_present=%s bias_present=%s token_positions_present=%s. "
+                "Dropping router states.",
+                output_router_inputs is not None,
+                output_router_logits is not None,
+                output_router_bias is not None,
+                output_router_token_positions is not None,
+            )
+            return None, None, None, None
+
+        if not (
+            len(output_router_inputs)
+            == len(output_router_logits)
+            == len(output_router_bias)
+            == len(output_router_token_positions)
+            == len(recv_obj.rids)
+        ):
+            logger.warning(
+                "[RouterStates] Router-state list length mismatch in detokenizer: "
+                "inputs=%s logits=%s bias=%s token_positions=%s rids=%s. Dropping router states.",
+                len(output_router_inputs),
+                len(output_router_logits),
+                len(output_router_bias),
+                len(output_router_token_positions),
+                len(recv_obj.rids),
+            )
+            return None, None, None, None
+
+        normalized_inputs = []
+        normalized_logits = []
+        normalized_bias = []
+        normalized_positions = []
+        for rid, router_inputs, router_logits, router_bias, router_token_positions in zip(
+            recv_obj.rids,
+            output_router_inputs,
+            output_router_logits,
+            output_router_bias,
+            output_router_token_positions,
+            strict=True,
+        ):
+            present = [
+                router_inputs is not None,
+                router_logits is not None,
+                router_bias is not None,
+                router_token_positions is not None,
+            ]
+            if any(present) and not all(present):
+                logger.warning(
+                    "[RouterStates] Inconsistent router-state quartet in detokenizer for rid=%s: "
+                    "inputs_present=%s logits_present=%s bias_present=%s token_positions_present=%s. "
+                    "Dropping router states for this request.",
+                    rid,
+                    present[0],
+                    present[1],
+                    present[2],
+                    present[3],
+                )
+                router_inputs = None
+                router_logits = None
+                router_bias = None
+                router_token_positions = None
+            normalized_inputs.append(router_inputs)
+            normalized_logits.append(router_logits)
+            normalized_bias.append(router_bias)
+            normalized_positions.append(router_token_positions)
+
+        return normalized_inputs, normalized_logits, normalized_bias, normalized_positions
+
+    def _extract_router_states(self, recv_obj: BatchTokenIDOutput):
+        """Extract and encode router inputs, logits, and bias for predictive routing replay."""
+        output_router_inputs, output_router_logits, output_router_bias, output_router_token_positions = (
+            self._normalize_router_state_quartets(recv_obj)
+        )
+        if output_router_inputs is None:
+            print(
+                f"[RouterStates] Detokenizer extract: no router states for batch size={len(recv_obj.rids)}",
+                flush=True,
+            )
+        else:
+            valid_count = sum(x is not None for x in output_router_inputs)
+            print(
+                f"[RouterStates] Detokenizer extract: valid_quartets={valid_count}/{len(recv_obj.rids)}",
+                flush=True,
+            )
+        
+        if output_router_inputs is not None:
+            output_router_inputs = [
+                (
+                    pybase64.b64encode(router_inputs.tobytes()).decode("utf-8")
+                    if router_inputs is not None
+                    else ""
+                )
+                for router_inputs in output_router_inputs
+            ]
+        
+        if output_router_logits is not None:
+            output_router_logits = [
+                (
+                    pybase64.b64encode(router_logits.tobytes()).decode("utf-8")
+                    if router_logits is not None
+                    else ""
+                )
+                for router_logits in output_router_logits
+            ]
+
+        if output_router_bias is not None:
+            output_router_bias = [
+                (
+                    pybase64.b64encode(router_bias.tobytes()).decode("utf-8")
+                    if router_bias is not None
+                    else ""
+                )
+                for router_bias in output_router_bias
+            ]
+        if output_router_token_positions is not None:
+            output_router_token_positions = [
+                (
+                    pybase64.b64encode(router_token_positions.tobytes()).decode("utf-8")
+                    if router_token_positions is not None
+                    else ""
+                )
+                for router_token_positions in output_router_token_positions
+            ]
+
+        return (
+            output_router_inputs,
+            output_router_logits,
+            output_router_bias,
+            output_router_token_positions,
+        )
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
@@ -345,15 +496,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _extract_routed_experts(
         self, recv_obj: BatchTokenIDOutput
     ) -> list[str | None] | None:
+        routed_experts_src = getattr(recv_obj, "routed_experts", None)
+        if routed_experts_src is None:
+            routed_experts_src = getattr(recv_obj, "output_routed_experts", None)
+
         routed_experts = None
-        if recv_obj.routed_experts is not None:
+        if routed_experts_src is not None:
             routed_experts = [
                 (
                     pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
                     if routed_experts is not None
                     else None
                 )
-                for routed_experts in recv_obj.routed_experts
+                for routed_experts in routed_experts_src
             ]
         return routed_experts
 
@@ -365,6 +520,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else []
         )
         routed_experts = self._extract_routed_experts(recv_obj)
+        output_router_inputs, output_router_logits, output_router_bias, output_router_token_positions = (
+            self._extract_router_states(recv_obj)
+        )
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -394,6 +552,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            output_routed_experts=routed_experts,
+            output_router_inputs=output_router_inputs,
+            output_router_logits=output_router_logits,
+            output_router_bias=output_router_bias,
+            output_router_token_positions=output_router_token_positions,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

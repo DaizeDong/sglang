@@ -220,6 +220,11 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
+def _debug_router_states_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_ROUTER_STATES", "").lower() in {"1", "true", "yes", "on"}
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -1482,6 +1487,19 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if _debug_router_states_enabled():
+            print(
+                "[RouterStates] Scheduler received request "
+                f"rid={recv_req.rid} return_router_states={recv_req.return_router_states} "
+                f"return_routed_experts={recv_req.return_routed_experts}",
+                flush=True,
+            )
+            logger.warning(
+                "[RouterStates] Scheduler received request rid=%s return_router_states=%s return_routed_experts=%s",
+                recv_req.rid,
+                recv_req.return_router_states,
+                recv_req.return_routed_experts,
+            )
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1513,6 +1531,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_router_states=recv_req.return_router_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -1647,6 +1666,23 @@ class Scheduler(
         recv_req: BatchTokenizedGenerateReqInput,
     ):
         """Handle optimized batch generate request."""
+        router_state_count = sum(req.return_router_states for req in recv_req)
+        routed_expert_count = sum(req.return_routed_experts for req in recv_req)
+        if _debug_router_states_enabled():
+            print(
+                "[RouterStates] Scheduler received batch "
+                f"size={len(recv_req)} router_state_reqs={router_state_count} "
+                f"routed_expert_reqs={routed_expert_count} "
+                f"first_rid={recv_req[0].rid if len(recv_req) > 0 else None}",
+                flush=True,
+            )
+            logger.warning(
+                "[RouterStates] Scheduler received batch size=%s router_state_reqs=%s routed_expert_reqs=%s first_rid=%s",
+                len(recv_req),
+                router_state_count,
+                routed_expert_count,
+                recv_req[0].rid if len(recv_req) > 0 else None,
+            )
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
         # Process each request in the batch
@@ -1871,6 +1907,10 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
+        if req.req_pool_idx is not None:
+            # The stashed request keeps its RID but will reacquire a req_pool_idx
+            # when the next prefill chunk is scheduled.
+            self.req_to_token_pool.free(req)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()

@@ -627,6 +627,10 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_router_states: bool = False
+    router_states_tokens_per_seq: Optional[int] = None  # Uniform subsample to this many tokens per sequence
+    router_states_sample_rate: float = 1.0  # Probability of returning router states (1.0 = always return)
+    enable_router_bias_predictor: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False

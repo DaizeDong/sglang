@@ -161,9 +161,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        # Initialize bias_predictor for predictive routing replay
+        server_args = get_global_server_args()
+        if server_args.enable_router_bias_predictor:
+            self.bias_predictor = torch.nn.Linear(
+                config.hidden_size,
+                config.num_experts,
+                bias=False,
+                device=torch.cuda.current_device(),
+                dtype=getattr(config, "torch_dtype", torch.float32),
+            )
+            # Zero initialization
+            torch.nn.init.zeros_(self.bias_predictor.weight)
+            logger.info(
+                f"[BiasPredictor] Layer {layer_id}: initialized with shape "
+                f"({config.hidden_size}, {config.num_experts})"
+            )
+        else:
+            self.bias_predictor = None
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
+            bias_predictor=self.bias_predictor,
             layer_id=layer_id,
         )
 

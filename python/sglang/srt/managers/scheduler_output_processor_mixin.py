@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.router_inputs_logits_capturer import get_global_router_states_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -35,7 +37,96 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+def _debug_router_states_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_ROUTER_STATES", "").lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def _router_state_payload_present(value) -> bool:
+    return value is not None and not (isinstance(value, str) and value == "")
+
+
+def _normalize_router_state_quartet(
+    router_inputs,
+    router_logits,
+    router_bias,
+    router_token_positions,
+    *,
+    rid: str,
+    expected_tokens: int,
+):
+    present = [
+        _router_state_payload_present(router_inputs),
+        _router_state_payload_present(router_logits),
+        _router_state_payload_present(router_bias),
+        _router_state_payload_present(router_token_positions),
+    ]
+    if not any(present):
+        return None, None, None, None
+    if not all(present):
+        logger.warning(
+            "[RouterStates] Inconsistent router-state quartet for rid=%s: "
+            "inputs_present=%s logits_present=%s bias_present=%s token_positions_present=%s. "
+            "Dropping router states.",
+            rid,
+            present[0],
+            present[1],
+            present[2],
+            present[3],
+        )
+        return None, None, None, None
+
+    observed_tokens = None
+    for field_name, value in (
+        ("router_inputs", router_inputs),
+        ("router_logits", router_logits),
+        ("router_bias", router_bias),
+        ("router_token_positions", router_token_positions),
+    ):
+        if not hasattr(value, "shape") or len(value.shape) == 0:
+            logger.warning(
+                "[RouterStates] Invalid %s payload for rid=%s: type=%s. Dropping router states.",
+                field_name,
+                rid,
+                type(value),
+            )
+            return None, None, None
+        if observed_tokens is None:
+            observed_tokens = int(value.shape[0])
+            continue
+        if value.shape[0] != observed_tokens:
+            logger.warning(
+                "[RouterStates] Inconsistent router-state token count for rid=%s %s: "
+                "expected_consistent=%s actual=%s. "
+                "Dropping router states.",
+                rid,
+                field_name,
+                observed_tokens,
+                value.shape[0],
+            )
+            return None, None, None, None
+
+    if observed_tokens is not None and observed_tokens > expected_tokens + 1:
+        logger.warning(
+            "[RouterStates] Unexpectedly large router-state payload for rid=%s: "
+            "expected_at_most=%s actual=%s. Dropping router states.",
+            rid,
+            expected_tokens + 1,
+            observed_tokens,
+        )
+        return None, None, None, None
+
+    if len(router_token_positions.shape) != 1:
+        logger.warning(
+            "[RouterStates] router_token_positions must be 1D for rid=%s, got shape=%s. Dropping router states.",
+            rid,
+            tuple(router_token_positions.shape),
+        )
+        return None, None, None, None
+
+    return router_inputs, router_logits, router_bias, router_token_positions
 
 
 class SchedulerOutputProcessorMixin:
@@ -109,6 +200,59 @@ class SchedulerOutputProcessorMixin:
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
+    
+    def maybe_collect_router_states(self: Scheduler, req: Req):
+        """Collect router inputs, logits, and bias for a finished request."""
+        if not req.return_router_states:
+            if _debug_router_states_enabled():
+                print(
+                    f"[RouterStates] Skipping collection for rid={req.rid} because return_router_states=False",
+                    flush=True,
+                )
+            return
+        router_inputs, router_logits, router_bias, router_token_positions = (
+            get_global_router_states_capturer().get_router_states(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=req.seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+            )
+        )
+        router_inputs, router_logits, router_bias, router_token_positions = _normalize_router_state_quartet(
+            router_inputs,
+            router_logits,
+            router_bias,
+            router_token_positions,
+            rid=req.rid,
+            expected_tokens=max(req.seqlen, 0),
+        )
+        req.router_inputs = router_inputs
+        req.router_logits = router_logits
+        req.router_bias = router_bias
+        req.router_token_positions = router_token_positions
+        if router_inputs is None:
+            logger.warning(
+                "[RouterStates] No router states captured for rid=%s seqlen=%s req_pool_idx=%s",
+                req.rid,
+                req.seqlen,
+                req.req_pool_idx,
+            )
+        else:
+            if _debug_router_states_enabled():
+                print(
+                    f"[RouterStates] maybe_collect_router_states rid={req.rid} "
+                    f"inputs_shape={tuple(router_inputs.shape)} logits_shape={tuple(router_logits.shape)} "
+                    f"bias_shape={tuple(router_bias.shape)} positions_shape={tuple(router_token_positions.shape)}",
+                    flush=True,
+                )
+                logger.warning(
+                    "[RouterStates] Captured router states for rid=%s inputs_shape=%s logits_shape=%s "
+                    "bias_shape=%s positions_shape=%s",
+                    req.rid,
+                    tuple(router_inputs.shape),
+                    tuple(router_logits.shape),
+                    tuple(router_bias.shape),
+                    tuple(router_token_positions.shape),
+                )
 
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
@@ -176,6 +320,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        self.maybe_collect_router_states(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -471,6 +616,21 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 self.maybe_collect_routed_experts(req)
+                self.maybe_collect_router_states(req)
+                if getattr(batch, "is_v2_eagle", False) and self.cur_batch.forward_mode.is_extend():
+                    # FIXME(lsyin): fix the messy logic here
+                    # 1) when not overlap (v2 impl), we free the extra tokens in the req
+                    # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
+                    start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
+                    end_p = allocate_lens_list[i]
+
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+                    self.token_to_kv_pool_allocator.free(indices_to_free)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -916,6 +1076,10 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        output_router_inputs = None
+        output_router_logits = None
+        output_router_bias = None
+        output_router_token_positions = None
 
         queue_times = []
         forward_entry_times = []
@@ -1125,6 +1289,16 @@ class SchedulerOutputProcessorMixin:
                         if k not in customized_info:
                             customized_info[k] = []
                         customized_info[k].append(v[send_token_offset:])
+                if req.return_router_states:
+                    if output_router_inputs is None:
+                        output_router_inputs = []
+                        output_router_logits = []
+                        output_router_bias = []
+                        output_router_token_positions = []
+                    output_router_inputs.append(req.router_inputs)
+                    output_router_logits.append(req.router_logits)
+                    output_router_bias.append(req.router_bias)
+                    output_router_token_positions.append(req.router_token_positions)
 
             if (
                 req.finished()
@@ -1176,6 +1350,11 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    output_routed_experts=routed_experts,
+                    output_router_inputs=output_router_inputs,
+                    output_router_logits=output_router_logits,
+                    output_router_bias=output_router_bias,
+                    output_router_token_positions=output_router_token_positions,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

@@ -104,6 +104,11 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.layers.moe.router_inputs_logits_capturer import (
+    RouterInputsLogitsCapturer,
+    get_global_router_states_capturer,
+    set_global_router_states_capturer,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -645,6 +650,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
+        )
+        
+        # Initialize router inputs/logits capturer for predictive routing replay
+        set_global_router_states_capturer(
+            RouterInputsLogitsCapturer.create(
+                enable=get_global_server_args().enable_return_router_states,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+        logger.warning(
+            "[RouterStates] Capturer initialized: enabled=%s sample_rate=%s tokens_per_seq=%s bias_predictor=%s",
+            get_global_server_args().enable_return_router_states,
+            get_global_server_args().router_states_sample_rate,
+            get_global_server_args().router_states_tokens_per_seq,
+            get_global_server_args().enable_router_bias_predictor,
         )
 
     def remote_instance_init_transfer_engine(self):
@@ -2430,6 +2453,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=output.can_run_graph,
+            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+        )
+        
+        # Copy cached router inputs/logits buffers back to CPU cache
+        get_global_router_states_capturer().on_forward_end(
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
